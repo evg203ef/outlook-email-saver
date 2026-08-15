@@ -11,8 +11,10 @@ The project was created as a personal learning project while building practical 
 - Exports messages from Inbox or Sent Items.
 - Supports optional filters by sender and date range.
 - Saves messages as `.txt`, `.html`, or native Outlook `.msg` files.
+- Lets the user choose the export format from the command-line menu.
 - Exports message attachments into a separate folder.
-- Sanitizes message subjects so they can safely be used in Windows filenames.
+- Sanitizes message subjects and attachment names for Windows-safe filenames.
+- Avoids overwriting existing exported files by adding a numeric suffix.
 - Writes failures and tracebacks to a local `outlook_errors.txt` log.
 - Can start Outlook automatically when it is not already running.
 
@@ -44,13 +46,21 @@ The command-line menu provides:
 3. Filtered Inbox export by age and sender
 0. Exit
 
+For each export, the program asks for an output folder, a message limit, and an export format:
+
+- TXT — readable plain-text export
+- HTML — preserves the message's HTML body when available
+- MSG — native Outlook message format
+
 The default output directory is `./emails`.
 
 ## How it works
 
-The application uses `pywin32` to access the Outlook COM object model. It obtains the active Outlook application when possible, starts Outlook when necessary, connects to the MAPI namespace, selects a folder, applies simple filters, and writes each matching message to disk.
+The application uses `pywin32` to access the Outlook COM object model. It obtains the active Outlook application when possible, starts Outlook when necessary, connects to the MAPI namespace, selects a supported default folder, applies simple filters, and writes each matching message to disk.
 
-The exporter also checks for attachments and saves them alongside the exported message.
+Date filtering compares the message timestamp directly with the calculated cutoff. Folder lookup fails explicitly instead of silently falling back to an unrelated folder.
+
+The exporter also checks for attachments and saves them alongside the exported message. Attachment filenames and generated message filenames are sanitized for Windows and existing files are not overwritten.
 
 ## Error handling
 
@@ -70,10 +80,10 @@ This project was developed with extensive use of AI coding assistants, including
 
 - Windows and Outlook Desktop only.
 - The implementation relies on the Outlook COM object model rather than the Microsoft Graph API.
-- Folder selection currently covers the main default folders through the interactive CLI; the folder-listing code shows the accounts and child folders available in the local profile.
+- Folder selection currently covers Outlook's main default folders through the CLI; the folder-listing code also shows the accounts and child folders available in the local profile.
 - There is currently no automated test suite.
 - The UI is intentionally minimal and command-line based.
 
 ## Project status
 
-Personal portfolio / learning project. The tool is functional for local Outlook email export and is intended as a practical demonstration of Python, Windows automation, file handling, filtering, and iterative debugging.
+Personal portfolio / learning project. The tool is functional for local Outlook email export and is intended as a practical demonstration of Python, Windows automation, file handling, filtering, error handling, and iterative debugging.
