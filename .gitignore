@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.vscode/
+.idea/
+
+# Generated files
+outlook_errors.txt
+emails/
+*.msg
+*.html
+*.txt
+*_att/
+
+# Local secrets / environment
+.env
+*.pem
+*.key
