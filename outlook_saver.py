@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 import win32com.client
 
 LOG_FILE = "outlook_errors.txt"
+INVALID_FILENAME_CHARS = r'[<>:"/\\|?*\r\n]'
 
 
 def clean_text(text):
@@ -26,6 +27,27 @@ def clean_text(text):
     return text.strip()
 
 
+def safe_filename(value, fallback="file"):
+    """Return a Windows-safe filename component."""
+    value = re.sub(INVALID_FILENAME_CHARS, "_", str(value or ""))
+    value = value.strip(" .")
+    return (value or fallback)[:100]
+
+
+def unique_path(base_path):
+    """Return a non-existing path by adding a numeric suffix when necessary."""
+    if not os.path.exists(base_path):
+        return base_path
+
+    stem, extension = os.path.splitext(base_path)
+    counter = 2
+    while True:
+        candidate = f"{stem}_{counter}{extension}"
+        if not os.path.exists(candidate):
+            return candidate
+        counter += 1
+
+
 def log_error(context, error):
     """Append an error with context and traceback to the local log file."""
     try:
@@ -33,10 +55,11 @@ def log_error(context, error):
             file.write(
                 f"\n{'=' * 50}\n"
                 f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {context}\n"
-                f"Ошибка: {type(error).__name__}: {error}\n"
+                f"Error: {type(error).__name__}: {error}\n"
                 f"{traceback.format_exc()}"
             )
     except OSError:
+        # Logging should never crash the main export workflow.
         pass
 
 
@@ -92,10 +115,14 @@ class OutlookSaver:
         try:
             self.namespace.Logon("", "", False, False)
         except Exception:
+            # Outlook may already have an authenticated session.
             pass
 
         time.sleep(2)
-        print("Accounts: " + ", ".join(folder.Name for folder in self.namespace.Folders))
+        print(
+            "Accounts: "
+            + ", ".join(folder.Name for folder in self.namespace.Folders)
+        )
         self.show_folders()
 
     def show_folders(self):
@@ -110,11 +137,19 @@ class OutlookSaver:
                     continue
 
     def get_folder(self, name="inbox"):
-        """Get one of Outlook's default folders."""
+        """Get one of Outlook's supported default folders.
+
+        Raises ValueError instead of silently falling back to an unrelated folder.
+        """
+        if name not in self.FOLDERS:
+            raise ValueError(f"Unsupported Outlook folder: {name}")
+
         try:
-            return self.namespace.GetDefaultFolder(self.FOLDERS.get(name, 6))
-        except Exception:
-            return self.namespace.Folders.Item(1).Folders.Item(1)
+            return self.namespace.GetDefaultFolder(self.FOLDERS[name])
+        except Exception as error:
+            raise RuntimeError(
+                f"Could not access Outlook folder '{name}'."
+            ) from error
 
     def get_emails(self, folder=None, limit=50, days=None, sender=None, subject=None):
         """Collect messages matching optional date, sender and subject filters."""
@@ -127,7 +162,7 @@ class OutlookSaver:
             return []
 
         result = []
-        cutoff = datetime.now() - timedelta(days=days) if days else None
+        cutoff = datetime.now() - timedelta(days=days) if days is not None else None
 
         for index in range(1, count + 1):
             if limit and len(result) >= limit:
@@ -146,15 +181,15 @@ class OutlookSaver:
                         received = getattr(message, "ReceivedTime", None)
                         sent = getattr(message, "SentOn", None)
                         message_time = received or sent
-                        if message_time and datetime(
-                            message_time.year, message_time.month, message_time.day
-                        ) < cutoff:
+                        if message_time and message_time < cutoff:
                             continue
-                    except Exception:
-                        pass
+                    except Exception as error:
+                        log_error(f"Date filter: item {index}", error)
 
                 if sender:
-                    address = str(getattr(message, "SenderEmailAddress", "") or "")
+                    address = str(
+                        getattr(message, "SenderEmailAddress", "") or ""
+                    )
                     if sender.lower() not in address.lower():
                         continue
 
@@ -169,47 +204,56 @@ class OutlookSaver:
 
     def save(self, message, path, fmt="txt"):
         """Save one Outlook message and its attachments."""
-        safe_subject = re.sub(
-            r'[<>:"/\\|?*\r\n]',
-            "_",
-            str(message.Subject or "NoSubject"),
+        if fmt not in {"txt", "html", "msg"}:
+            raise ValueError(f"Unsupported export format: {fmt}")
+
+        safe_subject = safe_filename(
+            getattr(message, "Subject", None) or "NoSubject",
+            fallback="NoSubject",
         )[:60]
 
         try:
-            date = message.ReceivedTime.strftime("%Y%m%d_%H%M")
+            date = message.ReceivedTime.strftime("%Y%m%d_%H%M%S")
         except Exception:
             try:
-                date = message.SentOn.strftime("%Y%m%d_%H%M")
+                date = message.SentOn.strftime("%Y%m%d_%H%M%S")
             except Exception:
-                date = datetime.now().strftime("%Y%m%d_%H%M")
+                date = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        file_path = os.path.join(path, f"{date}_{safe_subject}")
+        base_path = os.path.join(path, f"{date}_{safe_subject}")
 
         if fmt == "msg":
-            message.SaveAs(file_path + ".msg", 3)
+            output_path = unique_path(base_path + ".msg")
+            message.SaveAs(output_path, 3)
         elif fmt == "txt":
-            with open(file_path + ".txt", "w", encoding="utf-8") as file:
+            output_path = unique_path(base_path + ".txt")
+            with open(output_path, "w", encoding="utf-8") as file:
                 sender = clean_text(getattr(message, "SenderName", "") or "")
                 subject = clean_text(str(message.Subject or ""))
                 body = clean_text(str(message.Body or ""))
                 file.write(f"From: {sender}\nSubject: {subject}\n\n{body}")
         else:
-            with open(file_path + ".html", "w", encoding="utf-8") as file:
+            output_path = unique_path(base_path + ".html")
+            with open(output_path, "w", encoding="utf-8") as file:
                 body = getattr(message, "HTMLBody", None) or getattr(
                     message, "Body", ""
                 )
-                file.write(f"<html><meta charset='utf-8'><body>{body}</body></html>")
+                file.write(
+                    f"<html><meta charset='utf-8'><body>{body}</body></html>"
+                )
 
         try:
             for index in range(1, message.Attachments.Count + 1):
                 attachment = message.Attachments.Item(index)
-                attachment_dir = file_path + "_att"
+                attachment_dir = os.path.splitext(output_path)[0] + "_att"
                 os.makedirs(attachment_dir, exist_ok=True)
-                attachment.SaveAsFile(os.path.join(attachment_dir, attachment.FileName))
+                filename = safe_filename(attachment.FileName, fallback="attachment")
+                attachment_path = unique_path(os.path.join(attachment_dir, filename))
+                attachment.SaveAsFile(attachment_path)
         except Exception as error:
             log_error(f"Attachments: {message.Subject}", error)
 
-        return file_path
+        return output_path
 
     def bulk_save(self, path=".", folder="inbox", fmt="txt", **filters):
         """Save multiple matching messages to a local directory."""
@@ -220,44 +264,79 @@ class OutlookSaver:
         saved = 0
         for index, message in enumerate(emails, 1):
             try:
-                file_path = self.save(message, path, fmt)
-                print(f"  [{index}/{len(emails)}] OK: {os.path.basename(file_path)}")
+                output_path = self.save(message, path, fmt)
+                print(
+                    f"  [{index}/{len(emails)}] OK: {os.path.basename(output_path)}"
+                )
                 saved += 1
             except Exception as error:
                 log_error(f"Save: {message.Subject}", error)
+                print(f"  [{index}] FAIL: {error}")
 
-        print(f"Saved successfully: {saved}/{len(emails)}")
+        print(f"\nDone! Saved: {saved}/{len(emails)}")
         return saved
 
 
-def main():
-    saver = OutlookSaver()
-    print("\nOutlook Email Saver")
-    print("1. Export Inbox")
-    print("2. Export Sent Items")
-    print("3. Filter Inbox")
-    print("0. Exit")
+def choose_format():
+    """Ask the user which export format to use."""
+    print("\nFormat: 1. TXT  2. HTML  3. MSG")
+    choice = input("Format [1]: ").strip() or "1"
+    formats = {"1": "txt", "2": "html", "3": "msg"}
+    if choice not in formats:
+        raise ValueError("Unknown export format")
+    return formats[choice]
 
-    choice = input("Choose an option: ").strip()
-    if choice == "0":
+
+def main():
+    """Run the interactive command-line interface."""
+    print("=" * 40)
+    print("   OUTLOOK EMAIL SAVER")
+    print("=" * 40)
+
+    try:
+        saver = OutlookSaver()
+    except Exception as error:
+        log_error("Init", error)
+        print(f"Outlook connection error: {error}")
+        input("Press Enter to exit...")
         return
 
-    output = os.path.join(os.getcwd(), "emails")
+    while True:
+        print("\n1. Inbox  2. Sent  3. Filters  0. Exit")
+        choice = input("Choice: ").strip()
+        if choice == "0":
+            break
 
-    if choice == "1":
-        saver.bulk_save(output, folder="inbox", fmt="txt")
-    elif choice == "2":
-        saver.bulk_save(output, folder="sent", fmt="txt")
-    elif choice == "3":
+        if choice not in {"1", "2", "3"}:
+            print("Unknown option.")
+            continue
+
+        path = input("Output folder [./emails]: ").strip() or "./emails"
+
         try:
-            days = int(input("Emails from the last N days: ").strip())
-        except ValueError:
-            print("Invalid number of days.")
-            return
-        sender = input("Sender filter (optional): ").strip() or None
-        saver.bulk_save(output, folder="inbox", fmt="txt", days=days, sender=sender)
-    else:
-        print("Unknown option.")
+            limit = int(input("Limit [20]: ").strip() or 20)
+            fmt = choose_format()
+
+            if choice == "1":
+                saver.bulk_save(path, "inbox", fmt=fmt, limit=limit)
+            elif choice == "2":
+                saver.bulk_save(path, "sent", fmt=fmt, limit=limit)
+            else:
+                days = input("Days [all]: ").strip()
+                sender = input("Sender [all]: ").strip()
+                saver.bulk_save(
+                    path,
+                    "inbox",
+                    fmt=fmt,
+                    limit=limit,
+                    days=int(days) if days else None,
+                    sender=sender or None,
+                )
+        except Exception as error:
+            log_error("Menu", error)
+            print(f"Error: {error}")
+
+    input(f"\nError log: {os.path.abspath(LOG_FILE)}\nPress Enter to exit...")
 
 
 if __name__ == "__main__":
